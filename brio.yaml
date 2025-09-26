@@ -1,0 +1,321 @@
+esphome:
+  name: brio
+  friendly_name: Brio
+  includes:
+    - spot_state.h
+    - color_map.h
+    - debug_config.h
+    - brightness_map.h
+  # Active le mode debug à la compilation
+  platformio_options:
+    build_flags:
+      - -DDEBUG_MODE
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          init_color_lookup_direct();
+  
+esp32:
+  board: m5stack-atom
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+debug:
+  update_interval: 5s
+  
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "xxxxxxxxxxxxxxxxxxxxxxx"
+
+ota:
+  - platform: esphome
+    password: "xxxxxxxxxxxxxxxxxxxxxxx"
+  
+ethernet:
+  type: W5500
+  clk_pin: GPIO22
+  mosi_pin: GPIO33
+  miso_pin: GPIO23
+  cs_pin: GPIO19
+  clock_speed: 16Mhz
+  manual_ip:
+    static_ip: 192.168.1.38
+    gateway: 192.168.1.254
+    subnet: 255.255.255.0
+  use_address: 192.168.1.38
+
+web_server:
+  port: 80
+
+globals:
+  - id: commande_ble
+    type: std::vector<uint8_t>
+    restore_value: no
+
+ble_client:
+  # Connexion BRIO
+  - mac_address: xx:xx:xx:xx:xx:xx
+    id: ble_spots
+    on_connect:
+      then:
+        - lambda: |-
+            DBG_LOGD("Spots BRIO", "Connecté");
+    on_disconnect:
+      then:
+        - lambda: |-
+            DBG_LOGD("Spots BRIO", "Déconnecté");
+  
+script:
+  - id: envoyer_commande_ble
+    then:
+      - ble_client.ble_write:
+          id: ble_spots
+          service_uuid: 00035B03-58E6-07DD-021A-08123A000300
+          characteristic_uuid: 00035B03-58E6-07DD-021A-08123A000301
+          value: !lambda |-
+            // Construire un vecteur à partir du tableau global
+            return id(commande_ble);
+
+switch:
+  # Activation ou non de la connection bluetooth au BRIO
+  - platform: ble_client
+    id: ble_switch_com_brio
+    ble_client_id: ble_spots
+    name: "BRIO Communication"
+
+sensor:
+  - platform: ble_client
+    ble_client_id: ble_spots
+    name: "BRIO Notifications"
+    service_uuid: 00110E80-5731-11E5-889E-0002A5D5C51B
+    characteristic_uuid: 12342222-9012-3456-7890-123456789022
+    notify: True
+    update_interval: never
+    type: characteristic
+    disabled_by_default: True
+    lambda: |-
+      // Affichage de la notif reçue en rawhex
+      DBG_LOGD("raw_hex", "%s", format_hex_pretty((uint8_t*)x.data(), x.size()).c_str());
+
+
+      // Sécurité d’exécution
+      if (x.size() <= IDX_COULEUR) {
+        DBG_LOGE("Notif Etat", "Trame trop courte (%d octets)", x.size());
+        return 0.0f;
+      }
+
+      // spot éteint ou fermé
+      switch (x[IDX_ETAT]) {
+        case SPOT_ETEINT:   
+          spotState = SPOT_ETEINT;
+        
+          if (id(light_piscine).current_values.is_on()) {
+            DBG_LOGI("Etat Light", "Extinction du spot piscine ❌");
+            id(light_piscine).turn_off().perform();
+          }
+          break;
+        case SPOT_ALLUME:
+          spotState = SPOT_ALLUME;
+        
+          if (!id(light_piscine).current_values.is_on()) {
+            DBG_LOGI("Etat Light", "Allumage du spot piscine 💡");
+            id(light_piscine).turn_on().perform();
+          }
+          break;
+        default: 
+          {
+            spotState = SPOT_INCONNU;
+            DBG_LOGE("Notif Etat", "Non implementee %d", x[IDX_ETAT]);
+          };
+        }
+
+      // couleur spot
+      const ColorMap* cm = get_color_fast(x[IDX_COULEUR]);
+      if (cm) {
+        id(color_list).publish_state(cm->sensor_name);
+      } else {
+        DBG_LOGE("Notif Etat", "Non implémentée %d", x[IDX_COULEUR]);
+      }
+
+      return 1.0f;
+
+  - platform: ble_client
+    ble_client_id: ble_spots
+    name: "BRIO Notifications 2"
+    id: sensor_state    
+    service_uuid: 00110E80-5731-11E5-889E-0002A5D5C51B
+    characteristic_uuid: 12344444-1234-1234-1234-123412341234
+    type: characteristic
+    update_interval: never
+    notify: True
+    disabled_by_default: True
+    lambda: |-     
+      // Affichage de la notif reçue en rawhex
+      DBG_LOGD("raw_hex", "%s", format_hex_pretty((uint8_t*)x.data(), x.size()).c_str());
+
+      uint8_t val = x[IDX_BRIGHTNESS];
+      auto info = get_brightness_info(val);
+      id(color_brightness).publish_state(info.intensite);
+      id(color_speed).publish_state(info.vitesse);
+      DBG_LOGD("BLE", "Code 0x%02X => Intensité=%s, Vitesse=%s", val, info.intensite, info.vitesse);
+
+      return 1.0f;
+
+text_sensor:  
+  - platform: debug
+    #device:
+    #  name: "LOG Device Info"
+    reset_reason:
+      name: "LOG Reset Reason"
+
+select:
+  - platform: template
+    id: color_speed
+    name: "BRIO Vitesse"
+    optimistic: True
+    options:
+      - "Lente"
+      - "Normale"
+      - "Rapide"
+    set_action:
+      - lambda: |-
+          // Recherche de la commande BLE associée à la vitesse sélectionnée
+          if (x == "Lente") {
+            id(commande_ble).assign(
+              std::begin(BRIO_SPEED_SLOW),
+              std::end(BRIO_SPEED_SLOW));
+          }
+          else if (x == "Normale") {
+            id(commande_ble).assign(
+              std::begin(BRIO_SPEED_MEDIUM),
+              std::end(BRIO_SPEED_MEDIUM));
+          }
+          else if (x == "Rapide") {
+            id(commande_ble).assign(
+              std::begin(BRIO_SPEED_FAST),
+              std::end(BRIO_SPEED_FAST));
+          }
+          else {
+            DBG_LOGE("BRIO Vitesse", "Non implementee %s", x.c_str());
+          }
+
+          // Changement de vitesse
+          id(envoyer_commande_ble).execute();
+          return;
+
+  - platform: template
+    id: color_brightness
+    name: "BRIO Intensité"
+    optimistic: True
+    options:
+      - "Faible"
+      - "Moyenne"
+      - "Forte"
+      - "Maximale"
+    set_action:
+      - lambda: |-
+          // Recherche de la commande BLE associée à l'intensité sélectionnée
+          if (x == "Faible") {
+            id(commande_ble).assign(
+              std::begin(BRIO_BRIGHTNESS_LOW),
+              std::end(BRIO_BRIGHTNESS_LOW));
+          }
+          else if (x == "Moyenne") {
+            id(commande_ble).assign(
+              std::begin(BRIO_BRIGHTNESS_MEDIUM),
+              std::end(BRIO_BRIGHTNESS_MEDIUM));
+          }
+          else if (x == "Forte") {
+            id(commande_ble).assign(
+              std::begin(BRIO_BRIGHTNESS_STRONG),
+              std::end(BRIO_BRIGHTNESS_STRONG));
+          }
+          else if (x == "Maximale") {
+            id(commande_ble).assign(
+              std::begin(BRIO_BRIGHTNESS_MAXIMUM),
+              std::end(BRIO_BRIGHTNESS_MAXIMUM));
+          }
+          else {
+            DBG_LOGE("BRIO Intensité", "Non implementee %s", x.c_str());
+          }
+
+          // Changement d'intensité
+          id(envoyer_commande_ble).execute();
+          return;
+
+  - platform: template
+    id: color_list
+    name: "BRIO Liste couleur"
+    optimistic: True
+    options:
+      - "Blanc"
+      - "Bleu"
+      - "Lagon"
+      - "Cyan"
+      - "Violet"
+      - "Magenta"
+      - "Rose"
+      - "Rouge"
+      - "Orange"
+      - "Vert"
+      - "Favori"
+      - "Gradient"
+      - "Rainbow"
+      - "Parade"
+      - "Techno"
+      - "Horizon"
+      - "Hazard"
+      - "Magical"
+    set_action:
+      - lambda: |-
+          // Recherche de la commande BLE associée à la couleur sélectionnée
+          const ColorMap* cm = get_color_by_name(x.c_str());
+          if (cm) {
+            DBG_LOGI("DEBUG", "Sélection: %s → code %d", x.c_str(), cm->code);
+            // Log du contenu du buffer
+            //for (size_t i = 0; i < cm->values_len; i++) {
+            //  DBG_LOGD("bytes", "Octet %d = 0x%02X", i, cm->values[i]);
+            //}
+
+            // Changement de couleur
+            id(commande_ble).assign(cm->values, cm->values + cm->values_len);
+            id(envoyer_commande_ble).execute();
+          } else {
+            DBG_LOGE("DEBUG", "Impossible de lire le code pour: %s", x.c_str());
+            return;          
+          }
+
+output:
+  - platform: template
+    type: binary
+    id: light_piscine_output
+    write_action:
+    - lambda: |-
+        bool piscineOn  = id(light_piscine).current_values.is_on();
+
+        // Cas où l’état détecté ne correspond pas à l’état attendu
+        if ((spotState == SPOT_ETEINT && piscineOn) ||
+            (spotState == SPOT_ALLUME && !piscineOn)) {
+          
+          DBG_LOGI("Brio Light", piscineOn ? "On allume !" : "On éteint !");
+
+          id(commande_ble).assign(
+                std::begin(BRIO_COMMANDE_ON_OFF),
+                std::end(BRIO_COMMANDE_ON_OFF)
+          );
+          id(envoyer_commande_ble).execute();
+
+        } else {
+          DBG_LOGD("Brio Light", "RAS");
+        }
+
+light:
+  - platform: binary
+    id: light_piscine
+    name: "BRIO Spot"
+    output: light_piscine_output
